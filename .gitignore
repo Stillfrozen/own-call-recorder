@@ -1,0 +1,6 @@
+.build/
+records/
+*.xcuserstate
+*.swp
+*.tmp
+.DS_Store

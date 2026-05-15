@@ -1,0 +1,28 @@
+{
+  "allowedApps": [
+    {
+      "name": "Zoom",
+      "bundleID": "us.zoom.xos, us.zoom.caphost",
+      "windowTitleKeywords": [
+        "Zoom Meeting",
+        "Zoom Webinar",
+        "Zoom Workplace",
+        "| Zoom",
+        " - Zoom",
+        "— Zoom"
+      ]
+    },
+    {
+      "name": "Толк",
+      "bundleID": "ru.kontur.talk",
+      "windowTitleKeywords": [
+        "Толк",
+        "Tolk",
+        "Kontur",
+        "Talk",
+        "звонок",
+        "Call"
+      ]
+    }
+  ]
+}

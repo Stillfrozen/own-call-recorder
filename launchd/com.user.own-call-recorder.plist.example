@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.own-call-recorder</string>
+
+    <!-- Замени путь на реальный путь к скомпилированному бинарю -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/YOURNAME/bin/OwnRecorder</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PIPELINE_URL</key>
+        <string>http://localhost:9777</string>
+        <!-- Опционально: путь к директории логов -->
+        <!-- <key>OWN_RECORDER_LOG_PATH</key> -->
+        <!-- <string>/Users/YOURNAME/Library/Logs/own-call-recorder</string> -->
+    </dict>
+
+    <!-- Запускать при загрузке системы -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- launchd перезапускает при падении -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOURNAME/Library/Logs/own-call-recorder/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOURNAME/Library/Logs/own-call-recorder/stderr.log</string>
+
+    <!-- Тайм-аут при останове (секунды) -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+</dict>
+</plist>
