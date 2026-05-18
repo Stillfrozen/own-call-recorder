@@ -1,9 +1,10 @@
+import AppKit
 import Foundation
 import Network
 
 final class LocalControlServer {
     static let shared = LocalControlServer()
-    static let buildTag = "ocr-control-2026-05-15-r3"
+    static let buildTag = "ocr-control-2026-05-15-r4"
 
     private let settingsStore = SettingsStore.shared
     private let secretsStore = SecureSecretsStore.shared
@@ -196,7 +197,11 @@ final class LocalControlServer {
             let ok = await checkAnthropicKey(key)
             response = .json(200, ["ok": ok])
         default:
-            response = .plain(404, "not found")
+            if let recordsResponse = await routeRecords(req) {
+                response = recordsResponse
+            } else {
+                response = .plain(404, "not found")
+            }
         }
 
         if response.status >= 400 {
@@ -328,6 +333,96 @@ final class LocalControlServer {
         } catch {
             return false
         }
+    }
+
+    private func routeRecords(_ req: HTTPRequest) async -> HTTPResponse? {
+        let path = req.path
+        if req.method == "GET" && path == "/api/records" {
+            return await recordsListResponse()
+        }
+        guard path.hasPrefix("/api/records/") else { return nil }
+        let rest = String(path.dropFirst("/api/records/".count))
+        let parts = rest.split(separator: "/").map(String.init)
+        guard let rawSessionId = parts.first, !rawSessionId.isEmpty else { return .plain(404, "not found") }
+        let sessionId = rawSessionId.removingPercentEncoding ?? rawSessionId
+        let action = parts.count > 1 ? parts[1] : nil
+
+        switch (req.method, action) {
+        case ("GET", nil), ("GET", ""):
+            return await recordDetailResponse(sessionId: sessionId)
+        case ("GET", "status"):
+            return await recordStatusResponse(sessionId: sessionId)
+        case ("POST", "reprocess"):
+            return await recordReprocessResponse(sessionId: sessionId)
+        case ("POST", "reveal"):
+            return recordRevealResponse(sessionId: sessionId)
+        default:
+            return .plain(404, "not found")
+        }
+    }
+
+    private func processingSnapshot() async -> (ids: Set<String>, stages: [String: String]) {
+        await MainActor.run { TranscriptionJobRunner.shared.processingSnapshot() }
+    }
+
+    private func recordsListResponse() async -> HTTPResponse {
+        let snapshot = await processingSnapshot()
+        let entries = RecordsIndex.listAll(
+            processingSessionIds: snapshot.ids,
+            stages: snapshot.stages
+        )
+        return .json(200, [
+            "recordsRoot": RecordsArchive.rootDirectory().path,
+            "records": entries.map { $0.asJSONObject() },
+        ])
+    }
+
+    private func recordDetailResponse(sessionId: String) async -> HTTPResponse {
+        let snapshot = await processingSnapshot()
+        guard let entry = RecordsIndex.entry(
+            forSessionId: sessionId,
+            processingSessionIds: snapshot.ids,
+            stages: snapshot.stages
+        ) else {
+            return .json(404, ["ok": false, "error": "session not found"])
+        }
+        return .json(200, ["ok": true, "record": entry.asJSONObject()])
+    }
+
+    private func recordStatusResponse(sessionId: String) async -> HTTPResponse {
+        let snapshot = await processingSnapshot()
+        guard let entry = RecordsIndex.entry(
+            forSessionId: sessionId,
+            processingSessionIds: snapshot.ids,
+            stages: snapshot.stages
+        ) else {
+            return .json(404, ["ok": false, "error": "session not found"])
+        }
+        return .json(200, [
+            "ok": true,
+            "status": entry.status,
+            "stage": entry.stage as Any,
+            "error": entry.lastError as Any,
+        ])
+    }
+
+    private func recordReprocessResponse(sessionId: String) async -> HTTPResponse {
+        let started = await MainActor.run { TranscriptionJobRunner.shared.startReprocess(sessionId: sessionId) }
+        if !started {
+            if RecordsIndex.sessionDirectory(forSessionId: sessionId) == nil {
+                return .json(404, ["ok": false, "error": "session not found"])
+            }
+            return .json(409, ["ok": false, "error": "already processing"])
+        }
+        return .json(200, ["ok": true, "sessionId": sessionId, "status": RecordSessionStatus.processing.rawValue])
+    }
+
+    private func recordRevealResponse(sessionId: String) -> HTTPResponse {
+        guard let sessionDir = RecordsIndex.sessionDirectory(forSessionId: sessionId) else {
+            return .json(404, ["ok": false, "error": "session not found"])
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([sessionDir])
+        return .json(200, ["ok": true, "sessionPath": sessionDir.path])
     }
 
     private func checkAnthropicKey(_ key: String) async -> Bool {
@@ -465,6 +560,7 @@ private func statusText(_ code: Int) -> String {
     case 200: return "OK"
     case 400: return "Bad Request"
     case 404: return "Not Found"
+    case 409: return "Conflict"
     case 500: return "Internal Server Error"
     default: return "HTTP"
     }
@@ -487,6 +583,17 @@ extension LocalControlServer {
     #logs { width: 100%; min-height: 320px; font: 12px Menlo, monospace; white-space: pre; }
     .ok { color: #0a7a00; font-weight: 600; } .bad { color: #b00020; font-weight: 600; } .pending { color:#666; }
     .panel { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-top: 14px; }
+    table.records { width: 100%; border-collapse: collapse; font-size: 13px; }
+    table.records th, table.records td { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left; vertical-align: top; }
+    table.records td.path { font: 11px Menlo, monospace; color: #444; max-width: 280px; word-break: break-all; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+    .badge.complete { background: #e6f4ea; color: #0a7a00; }
+    .badge.transcribed_only { background: #e8f0fe; color: #1a56db; }
+    .badge.audio_only { background: #f3f4f6; color: #444; }
+    .badge.failed { background: #fde8e8; color: #b00020; }
+    .badge.processing { background: #fff4e5; color: #9a6700; }
+    .err-hint { font-size: 11px; color: #b00020; margin-top: 4px; max-width: 260px; }
+    .rec-actions button { margin-right: 6px; margin-bottom: 4px; }
   </style>
 </head>
 <body>
@@ -504,7 +611,7 @@ extension LocalControlServer {
     <div class="row"><label>xAI API key (Grok/fallback)</label><input id="xaiApiKey" /><span id="xaiHealth">—</span></div>
     <div class="row"><label>Groq API key (Whisper free)</label><input id="groqApiKey" /><span id="groqHealth">—</span></div>
     <div class="row"><label>Groq Whisper model</label><input id="groqModel" /><span></span></div>
-    <div class="row"><label></label><div class="pending">При 429/5xx у Groq STT автоматически переключается на Grok AI.</div><span></span></div>
+    <div class="row"><label></label><div class="pending">При сбое Groq STT (таймаут, 429, 5xx, сеть) автоматически переключается на Grok AI (xAI).</div><span></span></div>
     <div class="row"><label>Anthropic API key</label><input id="anthropicApiKey" /><span id="anthropicHealth">—</span></div>
     <div class="row"><label>xAI STT language</label><input id="xaiSttLanguage" /><span></span></div>
     <div class="row"><label>Summary API model</label><input id="summaryApiModel" /><span></span></div>
@@ -518,6 +625,28 @@ extension LocalControlServer {
     <div style="margin-top:10px;">
       <button onclick="save()">Сохранить</button>
       <span id="saveStatus" class="pending"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>Записи</h3>
+    <div style="margin-bottom:8px;">
+      <button onclick="refreshRecords()">Обновить список</button>
+      <span id="recordsStatus" class="pending"></span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table class="records">
+        <thead>
+          <tr>
+            <th>Дата</th>
+            <th>Название</th>
+            <th>Статус</th>
+            <th>Путь</th>
+            <th>Действия</th>
+          </tr>
+        </thead>
+        <tbody id="recordsBody"></tbody>
+      </table>
     </div>
   </div>
 
@@ -628,8 +757,95 @@ document.getElementById('xaiApiKey').addEventListener('input', () => { clearTime
 document.getElementById('groqApiKey').addEventListener('input', () => { clearTimeout(groqTimer); groqTimer = setTimeout(checkGroq, 500); });
 document.getElementById('anthropicApiKey').addEventListener('input', () => { clearTimeout(anthTimer); anthTimer = setTimeout(checkAnthropic, 500); });
 
-loadState().then(() => { refreshLogs(); debounceChecks(); });
+const statusLabels = {
+  complete: 'Готово',
+  transcribed_only: 'Только транскрипт',
+  audio_only: 'Только аудио',
+  failed: 'Ошибка',
+  processing: 'Обработка…',
+};
+
+function formatStartedAt(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString('ru-RU');
+}
+
+function statusBadge(rec) {
+  const st = rec.status || 'audio_only';
+  const stage = rec.stage ? (' (' + rec.stage + ')') : '';
+  return '<span class="badge ' + st + '">' + (statusLabels[st] || st) + stage + '</span>';
+}
+
+async function refreshRecords() {
+  const statusEl = document.getElementById('recordsStatus');
+  statusEl.textContent = 'Загрузка…'; statusEl.className = 'pending';
+  try {
+    const resp = await fetch('/api/records');
+    const data = await resp.json();
+    const body = document.getElementById('recordsBody');
+    body.innerHTML = '';
+    const records = data.records || [];
+    if (!records.length) {
+      body.innerHTML = '<tr><td colspan="5" class="pending">Записей пока нет</td></tr>';
+    } else {
+      for (const rec of records) {
+        const sid = encodeURIComponent(rec.sessionId);
+        const err = rec.lastError ? '<div class="err-hint">' + rec.lastError.replace(/</g,'&lt;') + '</div>' : '';
+        const busy = rec.status === 'processing';
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td>' + formatStartedAt(rec.startedAt) + '</td>' +
+          '<td>' + (rec.title || rec.sessionId).replace(/</g,'&lt;') + '</td>' +
+          '<td>' + statusBadge(rec) + err + '</td>' +
+          '<td class="path" title="' + (rec.sessionPath || '').replace(/"/g,'&quot;') + '">' + (rec.sessionPath || '—').replace(/</g,'&lt;') + '</td>' +
+          '<td class="rec-actions">' +
+            '<button onclick="revealRecord(\\'' + sid + '\\')">Finder</button>' +
+            '<button onclick="reprocessRecord(\\'' + sid + '\\')" ' + (busy ? 'disabled' : '') + '>Перезапустить</button>' +
+          '</td>';
+        body.appendChild(tr);
+      }
+    }
+    statusEl.textContent = records.length + ' записей';
+    statusEl.className = 'ok';
+  } catch (e) {
+    statusEl.textContent = 'Ошибка: ' + (e && e.message ? e.message : e);
+    statusEl.className = 'bad';
+  }
+}
+
+async function reprocessRecord(sessionIdEnc) {
+  const statusEl = document.getElementById('recordsStatus');
+  statusEl.textContent = 'Запуск…'; statusEl.className = 'pending';
+  try {
+    const resp = await fetch('/api/records/' + sessionIdEnc + '/reprocess', { method: 'POST' });
+    const r = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      statusEl.textContent = r.error || ('HTTP ' + resp.status);
+      statusEl.className = 'bad';
+    } else {
+      statusEl.textContent = 'Перезапуск принят';
+      statusEl.className = 'ok';
+    }
+    await refreshRecords();
+  } catch (e) {
+    statusEl.textContent = 'Сеть: ' + (e && e.message ? e.message : e);
+    statusEl.className = 'bad';
+  }
+}
+
+async function revealRecord(sessionIdEnc) {
+  try {
+    await fetch('/api/records/' + sessionIdEnc + '/reveal', { method: 'POST' });
+  } catch (e) {
+    alert('Не удалось открыть Finder: ' + (e && e.message ? e.message : e));
+  }
+}
+
+loadState().then(() => { refreshLogs(); refreshRecords(); debounceChecks(); });
 setInterval(refreshLogs, 4000);
+setInterval(refreshRecords, 8000);
 </script>
 </body>
 </html>

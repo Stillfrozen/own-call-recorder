@@ -15,6 +15,7 @@ enum TranscriptionError: Error, LocalizedError {
     case missingXAIAPIKey
     case missingGroqAPIKey
     case missingAnthropicAPIKey
+    case missingAudio
     case invalidResponse(String)
     case cursorAgentNotFound
     case cursorAgentFailed(String)
@@ -28,6 +29,8 @@ enum TranscriptionError: Error, LocalizedError {
             return "Missing Groq API key in settings"
         case .missingAnthropicAPIKey:
             return "Missing Anthropic API key in settings"
+        case .missingAudio:
+            return "No audio file found in session folder"
         case .invalidResponse(let message):
             return "Invalid API response: \(message)"
         case .cursorAgentNotFound:
@@ -52,8 +55,132 @@ final class TranscriptionManager {
     private let secretsStore = SecureSecretsStore.shared
     var onStageChanged: ((TranscriptionPipelineStage) -> Void)?
 
+    private static let sttRequestTimeoutSec: TimeInterval = {
+        if let raw = ProcessInfo.processInfo.environment["OWN_RECORDER_STT_TIMEOUT_SEC"],
+           let v = TimeInterval(raw), v > 60
+        {
+            return v
+        }
+        return 900
+    }()
+
+    private static let sttResourceTimeoutSec: TimeInterval = {
+        if let raw = ProcessInfo.processInfo.environment["OWN_RECORDER_STT_RESOURCE_TIMEOUT_SEC"],
+           let v = TimeInterval(raw), v > 120
+        {
+            return v
+        }
+        return 3600
+    }()
+
+    private static let sttURLSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = sttRequestTimeoutSec
+        config.timeoutIntervalForResource = sttResourceTimeoutSec
+        config.waitsForConnectivity = true
+        return URLSession(configuration: config)
+    }()
+
     func process(audioURL: URL, title: String, startedAt: Date, uploadID: String) async throws -> TranscriptionArtifacts {
         let sessionDir = audioURL.deletingLastPathComponent().deletingLastPathComponent()
+        clearError(in: sessionDir)
+        return try await runPipeline(
+            sessionDir: sessionDir,
+            audioURL: audioURL,
+            title: title,
+            startedAt: startedAt,
+            uploadID: uploadID
+        )
+    }
+
+    func reprocess(sessionDir: URL) async throws -> TranscriptionArtifacts {
+        guard let audioURL = Self.findAudioFile(in: sessionDir) else {
+            throw TranscriptionError.missingAudio
+        }
+        let context = Self.loadSessionContext(sessionDir: sessionDir)
+        clearError(in: sessionDir)
+        return try await runPipeline(
+            sessionDir: sessionDir,
+            audioURL: audioURL,
+            title: context.title,
+            startedAt: context.startedAt,
+            uploadID: context.uploadID
+        )
+    }
+
+    static func persistError(_ error: Error, sessionDir: URL) {
+        let resultDir = sessionDir.appendingPathComponent("result", isDirectory: true)
+        try? FileManager.default.createDirectory(at: resultDir, withIntermediateDirectories: true)
+        let errorURL = resultDir.appendingPathComponent("error.txt")
+        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let body = "\(ISO8601DateFormatter().string(from: Date()))\n\(message)\n"
+        try? body.write(to: errorURL, atomically: true, encoding: .utf8)
+    }
+
+    static func findAudioFile(in sessionDir: URL) -> URL? {
+        let audioDir = sessionDir.appendingPathComponent("audio", isDirectory: true)
+        if let url = firstRecordingFile(in: audioDir) { return url }
+        return firstRecordingFile(in: sessionDir)
+    }
+
+    private static func firstRecordingFile(in directory: URL) -> URL? {
+        guard let items = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        return items.first { url in
+            let name = url.lastPathComponent.lowercased()
+            if name.hasPrefix("recording.") { return true }
+            if !url.pathExtension.isEmpty, ["m4a", "mp3", "wav", "webm", "mp4", "ogg", "flac"].contains(url.pathExtension.lowercased()) {
+                return true
+            }
+            return false
+        }
+    }
+
+    private static func loadSessionContext(sessionDir: URL) -> (title: String, startedAt: Date, uploadID: String) {
+        let metadataURL = sessionDir.appendingPathComponent("result/metadata.json")
+        let legacyMetadataURL = sessionDir.appendingPathComponent("metadata.json")
+        let url = FileManager.default.fileExists(atPath: metadataURL.path) ? metadataURL : legacyMetadataURL
+        if let data = try? Data(contentsOf: url),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        {
+            let title = (json["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let uploadID = (json["upload_id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            var startedAt: Date?
+            if let raw = json["started_at"] as? String {
+                startedAt = ISO8601DateFormatter().date(from: raw)
+            }
+            return (
+                title: (title?.isEmpty == false) ? title! : sessionDir.lastPathComponent,
+                startedAt: startedAt ?? RecordsIndex.parseStartedAt(from: sessionDir.lastPathComponent)
+                    ?? (try? sessionDir.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                    ?? Date(),
+                uploadID: (uploadID?.isEmpty == false) ? uploadID! : UUID().uuidString
+            )
+        }
+        return (
+            title: sessionDir.lastPathComponent,
+            startedAt: RecordsIndex.parseStartedAt(from: sessionDir.lastPathComponent)
+                ?? (try? sessionDir.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? Date(),
+            uploadID: UUID().uuidString
+        )
+    }
+
+    private func clearError(in sessionDir: URL) {
+        let errorURL = sessionDir.appendingPathComponent("result/error.txt")
+        try? FileManager.default.removeItem(at: errorURL)
+    }
+
+    private func runPipeline(
+        sessionDir: URL,
+        audioURL: URL,
+        title: String,
+        startedAt: Date,
+        uploadID: String
+    ) async throws -> TranscriptionArtifacts {
         let transcribeDir = sessionDir.appendingPathComponent("transcribe", isDirectory: true)
         let resultDir = sessionDir.appendingPathComponent("result", isDirectory: true)
         try FileManager.default.createDirectory(at: transcribeDir, withIntermediateDirectories: true)
@@ -67,6 +194,8 @@ final class TranscriptionManager {
             let segmentsURL = transcribeDir.appendingPathComponent("segments.json")
             let segmentsData = try JSONSerialization.data(withJSONObject: sttResult.diarizedSegments, options: [.prettyPrinted])
             try segmentsData.write(to: segmentsURL)
+        } else if FileManager.default.fileExists(atPath: transcribeDir.appendingPathComponent("segments.json").path) {
+            try? FileManager.default.removeItem(at: transcribeDir.appendingPathComponent("segments.json"))
         }
 
         onStageChanged?(.summarizing)
@@ -85,15 +214,69 @@ final class TranscriptionManager {
             "stt_provider": sttResult.usedProvider.rawValue,
             "stt_fallback_from": sttResult.fallbackFromProvider?.rawValue ?? "",
             "summary_provider": settingsStore.load().summaryProvider.rawValue,
+            "last_reprocessed_at": ISO8601DateFormatter().string(from: Date()),
         ]
         let metadataData = try JSONSerialization.data(withJSONObject: metadata, options: [.prettyPrinted])
         try metadataData.write(to: metadataURL)
+        clearError(in: sessionDir)
 
         Logger.shared.info("TranscriptionManager: artifacts written in \(sessionDir.path)")
         return TranscriptionArtifacts(transcriptURL: transcriptURL, summaryURL: summaryURL, metadataURL: metadataURL)
     }
 
     private func transcribeWithProviderSelection(audioURL: URL) async throws -> STTResult {
+        let prepared = await AudioSTTPreprocessor.prepare(audioURL: audioURL)
+        var cleanupURLs: [URL] = []
+        if let c = prepared.cleanupURL { cleanupURLs.append(c) }
+        defer {
+            for url in cleanupURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+
+        let chunks = await AudioSTTPreprocessor.chunks(for: prepared.url)
+        if chunks.count > 1, let first = chunks.first, first.needsCleanup {
+            let chunkDir = first.url.deletingLastPathComponent()
+            if chunkDir.lastPathComponent.hasPrefix("own-stt-chunks-") {
+                cleanupURLs.append(chunkDir)
+            }
+        }
+
+        if chunks.count == 1 {
+            return try await transcribeSingleFile(audioURL: chunks[0].url)
+        }
+
+        Logger.shared.info("TranscriptionManager: STT in \(chunks.count) chunks")
+        var transcriptParts: [String] = []
+        var allSegments: [[String: Any]] = []
+        var usedProvider: STTProvider?
+        var fallbackFrom: STTProvider?
+
+        for (index, chunk) in chunks.enumerated() {
+            Logger.shared.info("TranscriptionManager: chunk \(index + 1)/\(chunks.count), offset \(Int(chunk.startOffsetSec))s")
+            let part = try await transcribeSingleFile(audioURL: chunk.url)
+            if usedProvider == nil {
+                usedProvider = part.usedProvider
+                fallbackFrom = part.fallbackFromProvider
+            }
+            let text = AudioSTTPreprocessor.offsetTranscriptLines(part.transcript, offsetSec: chunk.startOffsetSec)
+            if !text.isEmpty { transcriptParts.append(text) }
+            allSegments.append(contentsOf: part.diarizedSegments)
+        }
+
+        let merged = transcriptParts.joined(separator: "\n")
+        guard !merged.isEmpty else {
+            throw TranscriptionError.invalidResponse("empty transcript after chunk merge")
+        }
+        return STTResult(
+            transcript: merged,
+            diarizedSegments: allSegments,
+            usedProvider: usedProvider ?? settingsStore.load().sttProvider,
+            fallbackFromProvider: fallbackFrom
+        )
+    }
+
+    private func transcribeSingleFile(audioURL: URL) async throws -> STTResult {
         let settings = settingsStore.load()
         switch settings.sttProvider {
         case .xai:
@@ -115,10 +298,48 @@ final class TranscriptionManager {
     }
 
     private func shouldFallbackToXAI(for error: Error) -> Bool {
-        guard case let TranscriptionError.invalidResponse(msg) = error else { return false }
-        if msg.contains("status 429") { return true }
-        if msg.contains("status 500") || msg.contains("status 502") || msg.contains("status 503") || msg.contains("status 504") { return true }
+        if isTimeoutLike(error) { return true }
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut, .networkConnectionLost, .notConnectedToInternet,
+                 .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed,
+                 .dataNotAllowed, .internationalRoamingOff:
+                return true
+            default:
+                break
+            }
+        }
+        let ns = error as NSError
+        if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorTimedOut {
+            return true
+        }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? Error, isTimeoutLike(underlying) {
+            return true
+        }
+        if case let TranscriptionError.invalidResponse(msg) = error {
+            if msg.contains("status 401") || msg.contains("status 403") { return true }
+            if msg.contains("status 429") || msg.contains("status 408") { return true }
+            if msg.contains("status 500") || msg.contains("status 502") || msg.contains("status 503") || msg.contains("status 504") {
+                return true
+            }
+        }
         return false
+    }
+
+    private func isTimeoutLike(_ error: Error) -> Bool {
+        let msg = error.localizedDescription.lowercased()
+        if msg.contains("timed out") || msg.contains("timeout") || msg.contains("time out") {
+            return true
+        }
+        if let urlError = error as? URLError, urlError.code == .timedOut {
+            return true
+        }
+        let ns = error as NSError
+        return ns.domain == NSURLErrorDomain && ns.code == NSURLErrorTimedOut
+    }
+
+    private func sttTimeoutInterval() -> TimeInterval {
+        Self.sttRequestTimeoutSec
     }
 
     private func transcribeXAI(audioURL: URL) async throws -> (transcript: String, diarizedSegments: [[String: Any]]) {
@@ -155,9 +376,9 @@ final class TranscriptionManager {
         req.httpMethod = "POST"
         req.setValue("Bearer \(xaiAPIKey)", forHTTPHeaderField: "Authorization")
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 300
+        req.timeoutInterval = sttTimeoutInterval()
 
-        let (data, response) = try await URLSession.shared.upload(for: req, from: body)
+        let (data, response) = try await Self.sttURLSession.upload(for: req, from: body)
         guard let http = response as? HTTPURLResponse else {
             throw TranscriptionError.invalidResponse("non-http response")
         }
@@ -211,9 +432,9 @@ final class TranscriptionManager {
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        req.timeoutInterval = 300
+        req.timeoutInterval = sttTimeoutInterval()
 
-        let (data, response) = try await URLSession.shared.upload(for: req, from: body)
+        let (data, response) = try await Self.sttURLSession.upload(for: req, from: body)
         guard let http = response as? HTTPURLResponse else {
             throw TranscriptionError.invalidResponse("non-http response")
         }
@@ -368,8 +589,16 @@ final class TranscriptionManager {
 
     private func summarizeViaCursorAgent(transcript: String, title: String, workspaceDir: URL, transcriptDir: URL) async throws -> String {
         let settings = settingsStore.load()
-        let bin = settings.cursorAgentBin.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !bin.isEmpty else { throw TranscriptionError.cursorAgentNotFound }
+        guard let bin = CursorAgentLocator.resolve(configured: settings.cursorAgentBin) else {
+            let configured = settings.cursorAgentBin
+            let pathHint = ProcessInfo.processInfo.environment["PATH"] ?? "(empty)"
+            Logger.shared.error(
+                "TranscriptionManager: Cursor agent not found (configured=\(configured), PATH=\(pathHint)). " +
+                    "Set full path e.g. \(CursorAgentLocator.wellKnownPaths().first ?? "~/.local/bin/agent")"
+            )
+            throw TranscriptionError.cursorAgentNotFound
+        }
+        Logger.shared.info("TranscriptionManager: using Cursor agent at \(bin)")
 
         let promptFile = transcriptDir.appendingPathComponent("transcript_for_cursor.txt")
         try transcript.write(to: promptFile, atomically: true, encoding: .utf8)
@@ -411,17 +640,13 @@ final class TranscriptionManager {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
 
-        if executable.contains("/") {
-            proc.executableURL = URL(fileURLWithPath: executable)
-        } else if let resolved = ProcessInfo.processInfo.environment["PATH"]?
-            .split(separator: ":")
-            .map({ URL(fileURLWithPath: String($0)).appendingPathComponent(executable).path })
-            .first(where: { FileManager.default.isExecutableFile(atPath: $0) })
-        {
-            proc.executableURL = URL(fileURLWithPath: resolved)
-        } else {
+        let resolved = executable.contains("/")
+            ? ((executable as NSString).expandingTildeInPath)
+            : CursorAgentLocator.resolve(configured: executable)
+        guard let bin = resolved, FileManager.default.isExecutableFile(atPath: bin) else {
             throw TranscriptionError.cursorAgentNotFound
         }
+        proc.executableURL = URL(fileURLWithPath: bin)
         proc.arguments = arguments
 
         try proc.run()

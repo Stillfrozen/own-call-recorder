@@ -122,8 +122,23 @@ swift build -c release
 - переключатель системных уведомлений
 - live healthcheck ключей (`✅ / ❌`) прямо рядом с полями
 - live логи (автообновление)
+- **история записей** в `records/` с путями и кнопкой **Перезапустить транскрибацию**
+
+При выборе **Groq Whisper** и сбое STT (таймаут запроса, HTTP 429/408/5xx, сетевые ошибки) приложение автоматически повторяет распознавание через **xAI STT** (нужен xAI API key). В `metadata.json` поле `stt_fallback_from` будет `groq`.
 
 Секреты сохраняются в Keychain.
+
+### API записей (localhost:9780)
+
+| Method | Path | Описание |
+|--------|------|----------|
+| `GET` | `/api/records` | Список сессий и статусы |
+| `GET` | `/api/records/{sessionId}` | Одна сессия |
+| `GET` | `/api/records/{sessionId}/status` | Статус + stage при обработке |
+| `POST` | `/api/records/{sessionId}/reprocess` | Повтор STT + summary (409 если уже идёт) |
+| `POST` | `/api/records/{sessionId}/reveal` | Открыть папку в Finder |
+
+Статусы: `complete`, `transcribed_only`, `audio_only`, `failed`, `processing`. При ошибке пишется `result/error.txt`.
 
 ## Проверка после установки
 
@@ -151,8 +166,9 @@ swift build -c release
 - `audio/recording.mp3` (или `audio/recording.m4a`, если mp3 не собрался)
 - `transcribe/transcript.txt`
 - `transcribe/segments.json` (если провайдер вернул speaker-сегменты)
-- `result/summary.md`
-- `result/metadata.json`
+   - `result/summary.md`
+   - `result/metadata.json`
+6. В **Настройки** → вкладка **Записи**: запись видна в таблице; при сбое — **Перезапустить**.
 
 ## Уведомления по этапам
 
@@ -177,6 +193,10 @@ swift build -c release
 | `OWN_RECORDER_LOG_PATH` | `~/Library/Logs/own-call-recorder/` | директория логов |
 | `OWN_RECORDER_MIC` | `1` | `0/false/no` — не писать микрофон |
 | `OWN_RECORDER_RECORDS_DIR` | авто (`.../own-call-recorder/records`) | корень архива сессий |
+| `OWN_RECORDER_STT_TIMEOUT_SEC` | `900` | таймаут одного HTTP-запроса STT (сек) |
+| `OWN_RECORDER_STT_RESOURCE_TIMEOUT_SEC` | `3600` | общий лимит загрузки/ответа STT (сек) |
+
+Файлы **>12 MB** перед STT сжимаются через **ffmpeg** (16 kHz mono, 32 kbps). Записи **длиннее ~8 минут** режутся на куски по **10 минут** и транскрибируются по очереди (иначе облако обрывает запрос по таймауту). Переменные: `OWN_RECORDER_STT_CHUNK_THRESHOLD_SEC`, `OWN_RECORDER_STT_CHUNK_SEC`.
 
 ## Отладка
 

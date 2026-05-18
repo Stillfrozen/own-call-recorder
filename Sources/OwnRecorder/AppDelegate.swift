@@ -232,11 +232,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setAppState(.transcribing)
 
         Task {
+            var archivedAudioURL: URL?
             do {
                 let audioURL = try await audioRecorder.stopRecording(
                     archiveStartedAt: startedAt,
                     archiveTitle: title
                 )
+                archivedAudioURL = audioURL
                 notifications.post(title: "Own Recorder", body: "Закончил запись")
                 notifications.post(title: "Own Recorder", body: "Отправил на транскрайб")
 
@@ -248,6 +250,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
                 notifications.post(title: "Own Recorder", body: "Закончил транскрибацию")
             } catch {
+                if let archivedAudioURL {
+                    let sessionDir = archivedAudioURL.deletingLastPathComponent().deletingLastPathComponent()
+                    TranscriptionManager.persistError(error, sessionDir: sessionDir)
+                }
                 notifications.post(title: "Own Recorder", body: "Ошибка: \(error.localizedDescription)")
                 Logger.shared.error("AppDelegate: stop/process failed — \(error.localizedDescription)")
             }
