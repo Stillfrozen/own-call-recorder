@@ -1,40 +1,88 @@
 import Foundation
 
-/// Copies the finished recording into `<package-root>/records/record-ddmmyy-hhmm/audio/recording.<ext>`.
+/// Copies the finished recording into `<package-root>/records/YYYY-MM-DD_HHmm/audio/recording.<ext>`.
 enum RecordsArchive {
 
     /// Root directory for all sessions. Override with `OWN_RECORDER_RECORDS_DIR` (absolute or `~`).
+    ///
+    /// Do **not** walk up from `/Applications/OwnRecorder.app` looking for `Package.swift` —
+    /// that misses the project and falls back to `cwd/records`, which for a GUI app is `/records`
+    /// (read-only system volume). Pin via env, bundled `RecordsRoot.path`, compile-time `#filePath`,
+    /// or Application Support.
     static func rootDirectory() -> URL {
-        if let raw = ProcessInfo.processInfo.environment["OWN_RECORDER_RECORDS_DIR"]?.trimmingCharacters(in: .whitespaces),
-           !raw.isEmpty {
-            return URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+        if let fromEnv = expandedDirectory(ProcessInfo.processInfo.environment["OWN_RECORDER_RECORDS_DIR"]) {
+            return fromEnv
         }
-
+        if let fromBundle = bundledRecordsRoot() {
+            return fromBundle
+        }
         let binary = URL(fileURLWithPath: ProcessInfo.processInfo.arguments[0]).standardizedFileURL
-        var dir = binary.deletingLastPathComponent()
-        for _ in 0..<12 {
-            let pkg = dir.appendingPathComponent("Package.swift")
-            if FileManager.default.fileExists(atPath: pkg.path) {
+        if let fromBinary = recordsDirNearPackage(startingAt: binary) {
+            return fromBinary
+        }
+        if let fromSource = recordsDirNearPackage(startingAt: URL(fileURLWithPath: #filePath)) {
+            return fromSource
+        }
+        Logger.shared.warn("RecordsArchive: no Package.swift near binary — using Application Support")
+        return applicationSupportRecords()
+    }
+
+    private static func expandedDirectory(_ raw: String?) -> URL? {
+        guard let raw, !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let path = (raw.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+        return URL(fileURLWithPath: path, isDirectory: true)
+    }
+
+    /// Written by `scripts/install-app-launcher.sh` into `Contents/Resources/RecordsRoot.path`.
+    private static func bundledRecordsRoot() -> URL? {
+        guard let url = Bundle.main.url(forResource: "RecordsRoot", withExtension: "path"),
+              let raw = try? String(contentsOf: url, encoding: .utf8)
+        else { return nil }
+        return expandedDirectory(raw)
+    }
+
+    private static func recordsDirNearPackage(startingAt start: URL) -> URL? {
+        var dir = start.standardizedFileURL
+        var isDir: ObjCBool = false
+        if FileManager.default.fileExists(atPath: dir.path, isDirectory: &isDir), !isDir.boolValue {
+            dir = dir.deletingLastPathComponent()
+        }
+        for _ in 0..<16 {
+            if FileManager.default.fileExists(atPath: dir.appendingPathComponent("Package.swift").path) {
                 return dir.appendingPathComponent("records", isDirectory: true)
             }
             let parent = dir.deletingLastPathComponent()
             if parent.path == dir.path { break }
             dir = parent
         }
-
-        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true)
-            .appendingPathComponent("records", isDirectory: true)
+        return nil
     }
 
-    /// `record-ddMMyy-HHmm` in local timezone.
+    private static func applicationSupportRecords() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("OwnRecorder/records", isDirectory: true)
+    }
+
+    /// `YYYY-MM-DD_HHmm` in local timezone. Title is ignored (lives in INDEX.md).
     static func sessionFolderName(startedAt: Date, title: String?) -> String {
         let df = DateFormatter()
         df.locale = Locale(identifier: "en_US_POSIX")
         df.timeZone = TimeZone.current
-        df.dateFormat = "ddMMyy-HHmm"
-        let stamp = df.string(from: startedAt)
+        df.dateFormat = "yyyy-MM-dd_HHmm"
         _ = title
-        return "record-\(stamp)"
+        return df.string(from: startedAt)
+    }
+
+    /// Unique folder under `records/` for `baseName`, adding `_2`, `_3`, … on collision.
+    static func uniqueSessionDirectory(root: URL, baseName: String) -> URL {
+        var sessionDir = root.appendingPathComponent(baseName, isDirectory: true)
+        var counter = 1
+        while FileManager.default.fileExists(atPath: sessionDir.path) {
+            counter += 1
+            sessionDir = root.appendingPathComponent("\(baseName)_\(counter)", isDirectory: true)
+        }
+        return sessionDir
     }
 
     /// Moves `tempFile` into a new session folder under `records/`. Returns the new file URL.
@@ -43,12 +91,7 @@ enum RecordsArchive {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
 
         let baseName = sessionFolderName(startedAt: startedAt, title: title)
-        var sessionDir = root.appendingPathComponent(baseName, isDirectory: true)
-        var counter = 1
-        while FileManager.default.fileExists(atPath: sessionDir.path) {
-            counter += 1
-            sessionDir = root.appendingPathComponent("\(baseName)_\(counter)", isDirectory: true)
-        }
+        let sessionDir = uniqueSessionDirectory(root: root, baseName: baseName)
 
         let audioDir = sessionDir.appendingPathComponent("audio", isDirectory: true)
         let transcribeDir = sessionDir.appendingPathComponent("transcribe", isDirectory: true)
@@ -72,6 +115,7 @@ enum RecordsArchive {
         }
 
         Logger.shared.info("RecordsArchive: saved → \(dest.path)")
+        RecordsIndex.rewriteIndexMarkdown()
         return dest
     }
 }

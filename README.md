@@ -35,7 +35,7 @@ Menu bar приложение для macOS 13+:
   - STT via Grok (xAI) or Groq Whisper (free)
   - Summary via API (Anthropic) or Cursor Agent
             ↓
-[records/record-ddmmyy-hhmm/]
+[records/YYYY-MM-DD_HHmm/]
   - audio/recording.mp3|m4a
   - transcribe/transcript.txt (+ segments.json if provider returns speakers)
   - result/summary.md
@@ -58,35 +58,20 @@ Menu bar приложение для macOS 13+:
 | Microphone | System Settings → Privacy & Security | голос через AVAudioRecorder |
 | Notifications (опц.) | System Settings → Notifications | этапные уведомления |
 
-## Сборка и запуск
+## Установка
+
+Пошагово: [INSTALL.md](INSTALL.md). Коротко:
 
 ```bash
-cd /Users/ipashintsev/work/cursor-projects/wallet-meeting-summary/meeting-bot/own-call-recorder
+git clone https://github.com/Stillfrozen/own-call-recorder.git
+cd own-call-recorder
+brew install ffmpeg
 swift build -c release
-.build/arm64-apple-macosx/release/OwnRecorder
+./scripts/install-app-launcher.sh
+open /Applications/OwnRecorder.app
 ```
 
-Для Intel путь бинаря:
-
-```bash
-.build/x86_64-apple-macosx/release/OwnRecorder
-```
-
-## Установка для коллег (без установщика)
-
-1. Собрать release-бинарь на целевой архитектуре (`arm64` или `x86_64`).
-2. Передать папку проекта целиком или отдельный архив с бинарем и README.
-3. На машине коллеги запустить бинарь из терминала.
-4. Выдать права в macOS:
-   - `Screen & System Audio Recording`
-   - `Microphone`
-5. Открыть `Настройки...` в меню и заполнить:
-   - STT provider (`Grok AI` или `Groq Whisper free`)
-   - xAI/Groq/Anthropic API keys
-   - summary provider (`API` или `Cursor Agent`)
-   - горячие клавиши Start/Stop
-
-Для стабильного UX лучше держать путь запуска постоянным (например, из `~/Applications`), иначе macOS может повторно спрашивать разрешения.
+Не запускай голый `.build/.../OwnRecorder` — только `.app`. Иконка: `./scripts/build-app-icon.sh`.
 
 ## Работа из меню
 
@@ -149,7 +134,7 @@ swift build -c release
    - красный: запись
    - желтый: транскрибация
    - голубой: суммаризация
-5. Проверка артефактов в `records/record-ddmmyy-hhmm/`:
+5. Проверка артефактов в `records/YYYY-MM-DD_HHmm/`:
    - `audio/recording.*`
    - `transcribe/transcript.txt` (+ `segments.json` при наличии diarization у провайдера)
    - `result/summary.md`
@@ -159,7 +144,9 @@ swift build -c release
 
 После остановки записи создаётся сессия:
 
-`own-call-recorder/records/record-<ddmmyy-hhmm>/`
+`own-call-recorder/records/<YYYY-MM-DD_HHmm>/`
+
+Сводный список со ссылками — `records/INDEX.md` (новые сверху, пересобирается после каждой сессии). Старые папки `record-ddmmyy-hhmm` при старте приложения переименовываются в ISO.
 
 Внутри:
 

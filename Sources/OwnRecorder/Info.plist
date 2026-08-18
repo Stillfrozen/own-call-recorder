@@ -6,11 +6,19 @@
 	<string>com.workspace.own-call-recorder</string>
 	<key>CFBundleName</key>
 	<string>OwnRecorder</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>1.1</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Запись микрофона вместе с системным звуком для конспекта встречи.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Захват системного звука встречи (без картинки экрана) для конспекта.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Запись системного звука вместе с микрофоном для конспекта встречи.</string>
+	<key>NSUserNotificationAlertStyle</key>
+	<string>alert</string>
 </dict>
 </plist>

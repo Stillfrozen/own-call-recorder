@@ -1,5 +1,6 @@
 .build/
 records/
+Resources/AppIcon.iconset/
 *.xcuserstate
 *.swp
 *.tmp

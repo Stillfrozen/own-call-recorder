@@ -115,6 +115,7 @@ final class TranscriptionManager {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         let body = "\(ISO8601DateFormatter().string(from: Date()))\n\(message)\n"
         try? body.write(to: errorURL, atomically: true, encoding: .utf8)
+        RecordsIndex.rewriteIndexMarkdown()
     }
 
     static func findAudioFile(in sessionDir: URL) -> URL? {
@@ -221,6 +222,7 @@ final class TranscriptionManager {
         clearError(in: sessionDir)
 
         Logger.shared.info("TranscriptionManager: artifacts written in \(sessionDir.path)")
+        RecordsIndex.rewriteIndexMarkdown()
         return TranscriptionArtifacts(transcriptURL: transcriptURL, summaryURL: summaryURL, metadataURL: metadataURL)
     }
 

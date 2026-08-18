@@ -28,10 +28,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem?
     private var appState: AppRecorderState = .idle
+    /// Green tray dot after a successful transcript; cleared on next recording or opening records.
+    private var transcriptReadyBadge = false
+    private var appearanceObserver: NSKeyValueObservation?
 
     private var currentUploadID: String?
     private var currentTitle: String?
     private var recordingStartedAt: Date?
+
+    private let talkMeetingDetector = TalkMeetingDetector()
+    private let talkOfferPanel = TalkMeetingOfferPanel()
+    /// One offer per Talk call; reset when the second window disappears.
+    private var offeredThisTalkMeeting = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -42,17 +50,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupAudioRecorderCallbacks()
         setupHotkeys()
         notifications.ensureAuthorization()
+        notifications.onStartRecordingFromNotification = { [weak self] in
+            Task { @MainActor in
+                self?.talkOfferPanel.hide()
+                self?.manualStart()
+            }
+        }
+        talkOfferPanel.onStart = { [weak self] in
+            Task { @MainActor in self?.manualStart() }
+        }
+        talkOfferPanel.onDismiss = { [weak self] in
+            self?.notifications.dismissTalkMeetingOffer()
+        }
+        setupTalkMeetingDetector()
 
         controlServer.onSettingsSaved = { [weak self] in
             self?.configureHotkeysFromSettings()
             self?.refreshMenu()
         }
         controlServer.start()
+        RecordsMigrator.migrateIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        talkMeetingDetector.stop()
         hotkeys.unregisterAll()
         controlServer.stop()
+    }
+
+    private func setupTalkMeetingDetector() {
+        talkMeetingDetector.onMeetingStarted = { [weak self] in
+            DispatchQueue.main.async { self?.handleTalkMeetingStarted() }
+        }
+        talkMeetingDetector.onMeetingEnded = { [weak self] in
+            DispatchQueue.main.async { self?.handleTalkMeetingEnded() }
+        }
+        talkMeetingDetector.start()
+    }
+
+    private func handleTalkMeetingStarted() {
+        guard !offeredThisTalkMeeting else { return }
+        offeredThisTalkMeeting = true
+        guard appState == .idle else {
+            Logger.shared.info("TalkMeetingDetector: in call but recorder busy (\(appState)) — no offer")
+            return
+        }
+        notifications.postTalkMeetingOffer()
+        talkOfferPanel.show()
+    }
+
+    private func handleTalkMeetingEnded() {
+        offeredThisTalkMeeting = false
+        notifications.dismissTalkMeetingOffer()
+        talkOfferPanel.hide()
     }
 
     private func setupAudioRecorderCallbacks() {
@@ -84,8 +134,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem?.button {
-            button.image = NSImage(systemSymbolName: "mic.circle.fill", accessibilityDescription: "Own Recorder")
+            button.image = StatusBarIcon.image(
+                symbol: "mic.fill",
+                glyphColor: nil,
+                dot: nil,
+                appearance: button.effectiveAppearance
+            )
             button.toolTip = "Own Call Recorder"
+            appearanceObserver = button.observe(\.effectiveAppearance, options: [.new]) { [weak self] _, _ in
+                DispatchQueue.main.async { self?.updateStatusAppearance() }
+            }
         }
         updateStatusAppearance()
         refreshMenu()
@@ -116,7 +174,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let statusTitle: String
         switch appState {
-        case .idle: statusTitle = "○ Ожидание"
+        case .idle:
+            statusTitle = transcriptReadyBadge ? "● Транскрипт готов" : "○ Ожидание"
         case .recording: statusTitle = "● Запись..."
         case .transcribing: statusTitle = "◔ Транскрибация..."
         case .summarizing: statusTitle = "◕ Нейросводка..."
@@ -171,19 +230,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateStatusAppearance() {
         guard let button = statusItem?.button else { return }
-        button.image = NSImage(systemSymbolName: "mic.circle.fill", accessibilityDescription: "Own Recorder")
+        let appearance = button.effectiveAppearance
+        button.contentTintColor = nil
         switch appState {
         case .idle:
-            button.contentTintColor = NSColor.systemGray
-            button.toolTip = "Own Recorder: ожидание"
+            button.image = StatusBarIcon.image(
+                symbol: "mic.fill",
+                glyphColor: nil,
+                dot: transcriptReadyBadge ? .systemGreen : nil,
+                appearance: appearance
+            )
+            button.toolTip = transcriptReadyBadge
+                ? "Own Recorder: транскрипт готов"
+                : "Own Recorder: ожидание"
         case .recording:
-            button.contentTintColor = NSColor.systemRed
+            button.image = StatusBarIcon.image(
+                symbol: "mic.fill",
+                glyphColor: nil,
+                dot: .systemRed,
+                appearance: appearance
+            )
             button.toolTip = "Own Recorder: идет запись"
         case .transcribing:
-            button.contentTintColor = NSColor.systemYellow
+            button.image = StatusBarIcon.image(
+                symbol: "waveform",
+                glyphColor: .systemOrange,
+                dot: nil,
+                appearance: appearance
+            )
             button.toolTip = "Own Recorder: идет транскрибация"
         case .summarizing:
-            button.contentTintColor = NSColor.systemCyan
+            button.image = StatusBarIcon.image(
+                symbol: "text.alignleft",
+                glyphColor: .systemTeal,
+                dot: nil,
+                appearance: appearance
+            )
             button.toolTip = "Own Recorder: идет обработка нейронкой"
         }
     }
@@ -202,6 +284,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task {
             do {
                 _ = try await audioRecorder.startRecording()
+                self.transcriptReadyBadge = false
                 setAppState(.recording)
                 notifications.post(title: "Own Recorder", body: "Начал запись")
                 Logger.shared.info("AppDelegate: manual recording started id=\(currentUploadID ?? "-")")
@@ -248,6 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     startedAt: startedAt,
                     uploadID: uploadID
                 )
+                self.transcriptReadyBadge = true
                 notifications.post(title: "Own Recorder", body: "Закончил транскрибацию")
             } catch {
                 if let archivedAudioURL {
@@ -266,6 +350,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openRecordsFolder() {
+        transcriptReadyBadge = false
+        updateStatusAppearance()
+        refreshMenu()
         NSWorkspace.shared.open(RecordsArchive.rootDirectory())
     }
 
