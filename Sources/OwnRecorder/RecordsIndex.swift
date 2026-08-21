@@ -87,20 +87,19 @@ enum RecordsIndex {
         processingSessionIds: Set<String> = [],
         stages: [String: String] = [:]
     ) -> RecordSessionEntry? {
-        let root = RecordsArchive.rootDirectory()
-        let sessionDir = root.appendingPathComponent(sessionId, isDirectory: true)
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: sessionDir.path, isDirectory: &isDir), isDir.boolValue else {
-            return nil
-        }
+        guard let sessionDir = sessionDirectory(forSessionId: sessionId) else { return nil }
         return scanSession(sessionDir: sessionDir, processingSessionIds: processingSessionIds, stages: stages)
     }
 
     static func sessionDirectory(forSessionId sessionId: String) -> URL? {
-        let root = RecordsArchive.rootDirectory()
-        let sessionDir = root.appendingPathComponent(sessionId, isDirectory: true)
+        guard isCanonicalFolderName(sessionId) else { return nil }
+        let root = RecordsArchive.rootDirectory().standardizedFileURL
+        let sessionDir = root.appendingPathComponent(sessionId, isDirectory: true).standardizedFileURL
+        let rootPath = root.path
+        let sessionPath = sessionDir.path
+        guard sessionPath == rootPath || sessionPath.hasPrefix(rootPath + "/") else { return nil }
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: sessionDir.path, isDirectory: &isDir), isDir.boolValue else {
+        guard FileManager.default.fileExists(atPath: sessionPath, isDirectory: &isDir), isDir.boolValue else {
             return nil
         }
         return sessionDir

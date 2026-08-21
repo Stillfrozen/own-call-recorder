@@ -319,7 +319,7 @@ final class TranscriptionManager {
             return true
         }
         if case let TranscriptionError.invalidResponse(msg) = error {
-            if msg.contains("status 401") || msg.contains("status 403") { return true }
+            if msg.contains("status 401") || msg.contains("status 403") { return false }
             if msg.contains("status 429") || msg.contains("status 408") { return true }
             if msg.contains("status 500") || msg.contains("status 502") || msg.contains("status 503") || msg.contains("status 504") {
                 return true

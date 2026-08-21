@@ -1,16 +1,19 @@
 import AppKit
 import Foundation
 import Network
+import Security
 
 final class LocalControlServer {
     static let shared = LocalControlServer()
-    static let buildTag = "ocr-control-2026-05-15-r4"
+    static let buildTag = "ocr-control-2026-08-21-r1"
+    private static let maxRequestBytes = 64 * 1024
 
     private let settingsStore = SettingsStore.shared
     private let secretsStore = SecureSecretsStore.shared
     private let queue = DispatchQueue(label: "com.own-recorder.control-server")
     private var listener: NWListener?
     private(set) var port: UInt16 = 9780
+    private var sessionToken = ""
     var onSettingsSaved: (() -> Void)?
 
     private init() {}
@@ -18,10 +21,19 @@ final class LocalControlServer {
     func start(port: UInt16 = 9780) {
         guard listener == nil else { return }
         self.port = port
+        sessionToken = Self.makeSessionToken()
 
         do {
             let params = NWParameters.tcp
-            let listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
+            params.allowLocalEndpointReuse = true
+            guard let loopback = IPv4Address("127.0.0.1"),
+                  let nwPort = NWEndpoint.Port(rawValue: port) else {
+                throw NSError(domain: "LocalControlServer", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "invalid loopback endpoint",
+                ])
+            }
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(loopback), port: nwPort)
+            let listener = try NWListener(using: params)
             listener.newConnectionHandler = { [weak self] connection in
                 self?.handle(connection: connection)
             }
@@ -30,7 +42,7 @@ final class LocalControlServer {
             }
             listener.start(queue: queue)
             self.listener = listener
-            Logger.shared.info("LocalControlServer: started on http://127.0.0.1:\(port)")
+            Logger.shared.info("LocalControlServer: started on http://127.0.0.1:\(port) (loopback, token required)")
         } catch {
             Logger.shared.error("LocalControlServer: failed to start — \(error.localizedDescription)")
         }
@@ -39,13 +51,70 @@ final class LocalControlServer {
     func stop() {
         listener?.cancel()
         listener = nil
+        sessionToken = ""
     }
 
     var rootURL: URL {
-        URL(string: "http://127.0.0.1:\(port)/")!
+        var comps = URLComponents()
+        comps.scheme = "http"
+        comps.host = "127.0.0.1"
+        comps.port = Int(port)
+        comps.path = "/"
+        comps.queryItems = [URLQueryItem(name: "token", value: sessionToken)]
+        return comps.url!
+    }
+
+    private static func makeSessionToken() -> String {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        if status == errSecSuccess {
+            return bytes.map { String(format: "%02x", $0) }.joined()
+        }
+        return UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    }
+
+    private func constantTimeEquals(_ a: String, _ b: String) -> Bool {
+        let aa = Array(a.utf8)
+        let bb = Array(b.utf8)
+        guard aa.count == bb.count, !aa.isEmpty else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<aa.count { diff |= aa[i] ^ bb[i] }
+        return diff == 0
+    }
+
+    private func isAuthorized(_ req: HTTPRequest) -> Bool {
+        guard !sessionToken.isEmpty else { return false }
+        let provided = req.headers["x-own-recorder-token"] ?? req.queryItem("token") ?? ""
+        return constantTimeEquals(provided, sessionToken)
+    }
+
+    private func isLoopback(_ connection: NWConnection) -> Bool {
+        switch connection.currentPath?.remoteEndpoint {
+        case .hostPort(let host, _):
+            switch host {
+            case .ipv4(let addr):
+                return addr == IPv4Address("127.0.0.1")
+            case .ipv6(let addr):
+                return addr == IPv6Address("::1")
+            case .name(let name, _):
+                return name == "localhost" || name == "127.0.0.1" || name == "::1"
+            @unknown default:
+                return false
+            }
+        default:
+            return true
+        }
     }
 
     private func handle(connection: NWConnection) {
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            if case .ready = state, !self.isLoopback(connection) {
+                Logger.shared.warn("LocalControlServer: dropped non-loopback peer")
+                connection.cancel()
+            }
+        }
         connection.start(queue: queue)
         readFullRequest(on: connection, accumulated: Data()) { [weak self] requestData in
             guard let self else {
@@ -84,6 +153,10 @@ final class LocalControlServer {
 
             var buffer = accumulated
             if let data { buffer.append(data) }
+            if buffer.count > Self.maxRequestBytes + 4096 {
+                completion(nil)
+                return
+            }
 
             if let fullLength = Self.fullHTTPRequestLength(in: buffer), buffer.count >= fullLength {
                 completion(buffer.subdata(in: 0..<fullLength))
@@ -125,6 +198,7 @@ final class LocalControlServer {
             }
         }
         if hasContentLength {
+            if contentLength > maxRequestBytes { return headerEnd.upperBound + contentLength }
             return headerEnd.upperBound + contentLength
         }
         // For methods that normally have no body, headers are enough.
@@ -164,12 +238,23 @@ final class LocalControlServer {
 
     private func route(rawRequest: Data) async -> HTTPResponse {
         guard let req = HTTPRequest.parse(rawRequest) else {
-            let snippet = String(data: rawRequest.prefix(400), encoding: .utf8) ?? "<binary \(rawRequest.count) B>"
-            Logger.shared.error("LocalControlServer: HTTP parse failed (\(rawRequest.count) B). raw=\(snippet)")
+            Logger.shared.error("LocalControlServer: HTTP parse failed (\(rawRequest.count) B)")
             return .plain(400, "bad request: parse failed")
         }
 
-        Logger.shared.info("LocalControlServer: \(req.method) \(req.rawPath) body=\(req.body.count) B")
+        if req.body.count > Self.maxRequestBytes {
+            return .plain(413, "payload too large")
+        }
+
+        Logger.shared.info("LocalControlServer: \(req.method) \(req.path) body=\(req.body.count) B")
+
+        guard isAuthorized(req) else {
+            Logger.shared.warn("LocalControlServer: unauthorized \(req.method) \(req.path)")
+            if req.method == "GET" && req.path == "/" {
+                return .html(401, Self.unauthorizedHTML)
+            }
+            return .json(401, ["ok": false, "error": "unauthorized"])
+        }
 
         let response: HTTPResponse
         switch (req.method, req.path) {
@@ -212,6 +297,9 @@ final class LocalControlServer {
 
     private func stateJSON() -> [String: Any] {
         let settings = settingsStore.load()
+        let xaiKey = secretsStore.get("xai_api_key") ?? secretsStore.get("groq_api_key") ?? ""
+        let groqKey = secretsStore.get("groq_whisper_api_key") ?? ""
+        let anthropicKey = secretsStore.get("anthropic_api_key") ?? ""
         return [
             "summaryProvider": settings.summaryProvider.rawValue,
             "sttProvider": settings.sttProvider.rawValue,
@@ -223,12 +311,19 @@ final class LocalControlServer {
             "startHotkey": settings.startHotkey,
             "stopHotkey": settings.stopHotkey,
             "notificationsEnabled": settings.notificationsEnabled,
-            "xaiApiKey": secretsStore.get("xai_api_key") ?? secretsStore.get("groq_api_key") ?? "",
-            "groqApiKey": secretsStore.get("groq_whisper_api_key") ?? "",
-            "anthropicApiKey": secretsStore.get("anthropic_api_key") ?? "",
+            "hasXaiKey": !xaiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "hasGroqKey": !groqKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "hasAnthropicKey": !anthropicKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
             "recordsRoot": RecordsArchive.rootDirectory().path,
             "logFile": RecorderLogger.logFileURL().path,
         ]
+    }
+
+    private func persistSecretIfPresent(_ raw: Any?, key: String) throws {
+        guard let text = raw as? String else { return }
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try secretsStore.set(trimmed, for: key)
     }
 
     private func saveSettings(_ body: Data) -> HTTPResponse {
@@ -240,13 +335,11 @@ final class LocalControlServer {
         do {
             parsed = try JSONSerialization.jsonObject(with: body)
         } catch {
-            let snippet = String(data: body.prefix(500), encoding: .utf8) ?? "<binary \(body.count) B>"
-            Logger.shared.error("saveSettings: JSON parse failed (\(body.count) B) — \(error.localizedDescription). body=\(snippet)")
+            Logger.shared.error("saveSettings: JSON parse failed (\(body.count) B) — \(error.localizedDescription)")
             return .json(400, ["ok": false, "error": "invalid json: \(error.localizedDescription)"])
         }
         guard let obj = parsed as? [String: Any] else {
-            let snippet = String(data: body.prefix(500), encoding: .utf8) ?? "<binary>"
-            Logger.shared.error("saveSettings: JSON is not an object. body=\(snippet)")
+            Logger.shared.error("saveSettings: JSON is not an object")
             return .json(400, ["ok": false, "error": "expected JSON object"])
         }
 
@@ -276,12 +369,12 @@ final class LocalControlServer {
 
         do {
             settingsStore.save(settings)
-            let xaiKey = obj["xaiApiKey"] as? String ?? ""
-            try secretsStore.set(xaiKey, for: "xai_api_key")
-            // Keep legacy key in sync for backward compatibility with previously saved configs.
-            try secretsStore.set(xaiKey, for: "groq_api_key")
-            try secretsStore.set(obj["groqApiKey"] as? String ?? "", for: "groq_whisper_api_key")
-            try secretsStore.set(obj["anthropicApiKey"] as? String ?? "", for: "anthropic_api_key")
+            try persistSecretIfPresent(obj["xaiApiKey"], key: "xai_api_key")
+            if let xai = obj["xaiApiKey"] as? String, !xai.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try secretsStore.set(xai.trimmingCharacters(in: .whitespacesAndNewlines), for: "groq_api_key")
+            }
+            try persistSecretIfPresent(obj["groqApiKey"], key: "groq_whisper_api_key")
+            try persistSecretIfPresent(obj["anthropicApiKey"], key: "anthropic_api_key")
             onSettingsSaved?()
             if let hotkeyWarning {
                 return .json(200, ["ok": true, "warning": hotkeyWarning])
@@ -301,8 +394,19 @@ final class LocalControlServer {
         return all.suffix(lines).joined(separator: "\n")
     }
 
+    private func resolvedSecret(submitted: String, storedKeys: [String]) -> String {
+        let trimmed = submitted.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        for key in storedKeys {
+            if let stored = secretsStore.get(key)?.trimmingCharacters(in: .whitespacesAndNewlines), !stored.isEmpty {
+                return stored
+            }
+        }
+        return ""
+    }
+
     private func checkXAIKey(_ key: String) async -> Bool {
-        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = resolvedSecret(submitted: key, storedKeys: ["xai_api_key", "groq_api_key"])
         guard !trimmed.isEmpty else { return false }
         guard let url = URL(string: "https://api.x.ai/v1/models") else { return false }
         var req = URLRequest(url: url)
@@ -319,7 +423,7 @@ final class LocalControlServer {
     }
 
     private func checkGroqKey(_ key: String) async -> Bool {
-        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = resolvedSecret(submitted: key, storedKeys: ["groq_whisper_api_key"])
         guard !trimmed.isEmpty else { return false }
         guard let url = URL(string: "https://api.groq.com/openai/v1/models") else { return false }
         var req = URLRequest(url: url)
@@ -426,7 +530,7 @@ final class LocalControlServer {
     }
 
     private func checkAnthropicKey(_ key: String) async -> Bool {
-        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = resolvedSecret(submitted: key, storedKeys: ["anthropic_api_key"])
         guard !trimmed.isEmpty else { return false }
         guard let url = URL(string: "https://api.anthropic.com/v1/models") else { return false }
         var req = URLRequest(url: url)
@@ -559,14 +663,24 @@ private func statusText(_ code: Int) -> String {
     switch code {
     case 200: return "OK"
     case 400: return "Bad Request"
+    case 401: return "Unauthorized"
     case 404: return "Not Found"
     case 409: return "Conflict"
+    case 413: return "Payload Too Large"
     case 500: return "Internal Server Error"
     default: return "HTTP"
     }
 }
 
 extension LocalControlServer {
+    static let unauthorizedHTML = """
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8" /><title>Own Recorder</title></head>
+<body>
+  <p>Панель настроек открывается только из меню приложения («Настройки…»). Не сохраняйте эту страницу в закладки.</p>
+</body></html>
+"""
+
     static let dashboardHTML = """
 <!doctype html>
 <html lang="ru">
@@ -608,11 +722,11 @@ extension LocalControlServer {
     <div class="row"><label>Summary provider</label>
       <select id="summaryProvider"><option value="api">API</option><option value="cursor_agent">Cursor Agent</option></select><span></span>
     </div>
-    <div class="row"><label>xAI API key (Grok/fallback)</label><input id="xaiApiKey" /><span id="xaiHealth">—</span></div>
-    <div class="row"><label>Groq API key (Whisper free)</label><input id="groqApiKey" /><span id="groqHealth">—</span></div>
+    <div class="row"><label>xAI API key (Grok/fallback)</label><input id="xaiApiKey" type="password" autocomplete="off" /><span id="xaiHealth">—</span></div>
+    <div class="row"><label>Groq API key (Whisper free)</label><input id="groqApiKey" type="password" autocomplete="off" /><span id="groqHealth">—</span></div>
     <div class="row"><label>Groq Whisper model</label><input id="groqModel" /><span></span></div>
     <div class="row"><label></label><div class="pending">При сбое Groq STT (таймаут, 429, 5xx, сеть) автоматически переключается на Grok AI (xAI).</div><span></span></div>
-    <div class="row"><label>Anthropic API key</label><input id="anthropicApiKey" /><span id="anthropicHealth">—</span></div>
+    <div class="row"><label>Anthropic API key</label><input id="anthropicApiKey" type="password" autocomplete="off" /><span id="anthropicHealth">—</span></div>
     <div class="row"><label>xAI STT language</label><input id="xaiSttLanguage" /><span></span></div>
     <div class="row"><label>Summary API model</label><input id="summaryApiModel" /><span></span></div>
     <div class="row"><label>Cursor agent binary</label><input id="cursorAgentBin" /><span></span></div>
@@ -657,6 +771,14 @@ extension LocalControlServer {
   </div>
 
 <script>
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+function api(path, opts) {
+  const u = new URL(path, location.origin);
+  if (TOKEN) u.searchParams.set('token', TOKEN);
+  const headers = Object.assign({ 'X-Own-Recorder-Token': TOKEN }, (opts && opts.headers) || {});
+  return fetch(u.toString(), Object.assign({}, opts || {}, { headers }));
+}
+
 let xaiTimer = null, groqTimer = null, anthTimer = null;
 
 function setHealth(id, state) {
@@ -668,12 +790,16 @@ function setHealth(id, state) {
 }
 
 async function loadState() {
-  const resp = await fetch('/api/state'); const s = await resp.json();
+  const resp = await api('/api/state'); const s = await resp.json();
   for (const k of Object.keys(s)) {
+    if (k === 'hasXaiKey' || k === 'hasGroqKey' || k === 'hasAnthropicKey') continue;
     const el = document.getElementById(k);
     if (!el) continue;
     if (el.type === 'checkbox') el.checked = !!s[k]; else el.value = s[k] ?? '';
   }
+  document.getElementById('xaiApiKey').placeholder = s.hasXaiKey ? 'сохранён в Keychain' : '';
+  document.getElementById('groqApiKey').placeholder = s.hasGroqKey ? 'сохранён в Keychain' : '';
+  document.getElementById('anthropicApiKey').placeholder = s.hasAnthropicKey ? 'сохранён в Keychain' : '';
   document.getElementById('status').textContent = 'Готово';
 }
 
@@ -681,10 +807,7 @@ async function save() {
   const payload = {
     sttProvider: document.getElementById('sttProvider').value,
     summaryProvider: document.getElementById('summaryProvider').value,
-    xaiApiKey: document.getElementById('xaiApiKey').value,
-    groqApiKey: document.getElementById('groqApiKey').value,
     groqModel: document.getElementById('groqModel').value,
-    anthropicApiKey: document.getElementById('anthropicApiKey').value,
     xaiSttLanguage: document.getElementById('xaiSttLanguage').value,
     summaryApiModel: document.getElementById('summaryApiModel').value,
     cursorAgentBin: document.getElementById('cursorAgentBin').value,
@@ -693,10 +816,16 @@ async function save() {
     stopHotkey: document.getElementById('stopHotkey').value,
     notificationsEnabled: document.getElementById('notificationsEnabled').checked,
   };
+  const xai = document.getElementById('xaiApiKey').value.trim();
+  const groq = document.getElementById('groqApiKey').value.trim();
+  const anth = document.getElementById('anthropicApiKey').value.trim();
+  if (xai) payload.xaiApiKey = xai;
+  if (groq) payload.groqApiKey = groq;
+  if (anth) payload.anthropicApiKey = anth;
   const status = document.getElementById('saveStatus');
   status.textContent = 'Сохраняем…'; status.className = 'pending';
   try {
-    const resp = await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const resp = await api('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     const build = resp.headers.get('X-Own-Recorder-Build') || '?';
     const raw = await resp.text();
     let r = {};
@@ -704,6 +833,10 @@ async function save() {
     if (resp.ok && r.ok) {
       status.textContent = (r.warning ? ('Сохранено с предупреждением: ' + r.warning) : 'Сохранено') + ' [' + build + ']';
       status.className = r.warning ? 'pending' : 'ok';
+      document.getElementById('xaiApiKey').value = '';
+      document.getElementById('groqApiKey').value = '';
+      document.getElementById('anthropicApiKey').value = '';
+      await loadState();
     } else {
       status.textContent = 'Ошибка ' + resp.status + ': ' + (r.error || raw.slice(0, 200)) + ' [' + build + ']';
       status.className = 'bad';
@@ -715,33 +848,30 @@ async function save() {
 }
 
 async function refreshLogs() {
-  const resp = await fetch('/api/logs?lines=300'); const r = await resp.json();
+  const resp = await api('/api/logs?lines=300'); const r = await resp.json();
   const ta = document.getElementById('logs'); ta.value = r.logs || ''; ta.scrollTop = ta.scrollHeight;
 }
 
 async function checkXAI() {
-  const key = document.getElementById('xaiApiKey').value.trim();
-  if (!key) { setHealth('xaiHealth', 'none'); return; }
   setHealth('xaiHealth', 'pending');
-  const resp = await fetch('/api/check/xai', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key}) });
+  const key = document.getElementById('xaiApiKey').value.trim();
+  const resp = await api('/api/check/xai', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key}) });
   const r = await resp.json().catch(() => ({ok:false}));
   setHealth('xaiHealth', r.ok ? 'ok' : 'bad');
 }
 
 async function checkGroq() {
-  const key = document.getElementById('groqApiKey').value.trim();
-  if (!key) { setHealth('groqHealth', 'none'); return; }
   setHealth('groqHealth', 'pending');
-  const resp = await fetch('/api/check/groq', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key}) });
+  const key = document.getElementById('groqApiKey').value.trim();
+  const resp = await api('/api/check/groq', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key}) });
   const r = await resp.json().catch(() => ({ok:false}));
   setHealth('groqHealth', r.ok ? 'ok' : 'bad');
 }
 
 async function checkAnthropic() {
-  const key = document.getElementById('anthropicApiKey').value.trim();
-  if (!key) { setHealth('anthropicHealth', 'none'); return; }
   setHealth('anthropicHealth', 'pending');
-  const resp = await fetch('/api/check/anthropic', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key}) });
+  const key = document.getElementById('anthropicApiKey').value.trim();
+  const resp = await api('/api/check/anthropic', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key}) });
   const r = await resp.json().catch(() => ({ok:false}));
   setHealth('anthropicHealth', r.ok ? 'ok' : 'bad');
 }
@@ -782,7 +912,7 @@ async function refreshRecords() {
   const statusEl = document.getElementById('recordsStatus');
   statusEl.textContent = 'Загрузка…'; statusEl.className = 'pending';
   try {
-    const resp = await fetch('/api/records');
+    const resp = await api('/api/records');
     const data = await resp.json();
     const body = document.getElementById('recordsBody');
     body.innerHTML = '';
@@ -819,7 +949,7 @@ async function reprocessRecord(sessionIdEnc) {
   const statusEl = document.getElementById('recordsStatus');
   statusEl.textContent = 'Запуск…'; statusEl.className = 'pending';
   try {
-    const resp = await fetch('/api/records/' + sessionIdEnc + '/reprocess', { method: 'POST' });
+    const resp = await api('/api/records/' + sessionIdEnc + '/reprocess', { method: 'POST' });
     const r = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       statusEl.textContent = r.error || ('HTTP ' + resp.status);
@@ -837,7 +967,7 @@ async function reprocessRecord(sessionIdEnc) {
 
 async function revealRecord(sessionIdEnc) {
   try {
-    await fetch('/api/records/' + sessionIdEnc + '/reveal', { method: 'POST' });
+    await api('/api/records/' + sessionIdEnc + '/reveal', { method: 'POST' });
   } catch (e) {
     alert('Не удалось открыть Finder: ' + (e && e.message ? e.message : e));
   }
